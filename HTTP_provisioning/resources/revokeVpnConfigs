@@ -1,0 +1,43 @@
+#!/bin/bash
+# Get the Intune token so that we are allowed to do api calls
+postParams='client_id={applicationId}&scope=https://graph.microsoft.com/.default&client_secret={secretToken}&grant_type=client_credentials'
+tokenResponse="$(curl -s -X POST 'https://login.microsoftonline.com/{tenantId}/oauth2/v2.0/token' -X POST -d "$postParams")"
+token="$(echo "$tokenResponse" | grep -o '"access_token":"[^"]*' | grep -o '[^"]*$')"
+
+# Receive the managed device ids of the Intune tenant
+url='https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$select=id'
+response="$(curl -i -s -X GET "$url" -H "Authorization: Bearer $token" -H 'Content-Type: application/json' -H 'ConsistencyLevel: eventual')"
+
+http_status=$(echo "$response" | awk 'NR==1 {print $2}' | tr -d '\n')
+
+if [ "$http_status" != "200" ]; then
+        printf "We did not receive a HTTP 200 ok response from Intune \n%s" "$response" >> /etc/eduVpnProvisioning/revocation.log
+        exit 1
+fi
+managedIds="$(echo "$response" | grep -o '"id":"[^"]*' | grep -o '[^"]*$')"
+
+# Retrieve our locally stored managed device ids
+localDeviceIds=$(cat "/etc/eduVpnProvisioning/localDeviceIds.txt")
+
+# Convert string to array, using newline as delimiter for the elements
+localDeviceIds=($localDeviceIds)
+
+managedIds=($managedIds)
+
+# Check the difference between the arrays
+revokeIds=( $(printf "%s\n" "${localDeviceIds[@]}" "${managedIds[@]}" "${managedIds[@]}" | sort | uniq -u) )
+
+# Revoke the VPN configs from unenrolled Intune devices
+for id in $revokeIds
+do
+        response=$(curl -i -s -d "user_id=$id" -H "Authorization: Bearer {adminApiToken}" "https://vpn.example/vpn-user-portal/admin/api/v1/destroy")
+        http_status=$(echo "$response" | awk 'NR==1 {print $2}' | tr -d '\n')
+        if [ "$http_status" = "204" ]; then
+                localDeviceIds=( "${localDeviceIds[@]/$id}" )
+		printf "Device %s\n" "$id has been revoked" >> /etc/eduVpnProvisioning/revocation.log
+        else
+                printf "We did not receive a HTTP 204 (no content) response from the eduVPN server \n%s" "$response" >> /etc/eduVpnProvisioning/revocation.log
+
+        fi
+done
+printf "%s\n" "${localDeviceIds[@]}" > /etc/eduVpnProvisioning/localDeviceIds.txt
